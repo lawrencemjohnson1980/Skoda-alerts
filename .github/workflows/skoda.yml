@@ -135,4 +135,19 @@ jobs:
               if pos and old.get("pos") and distance_m(pos, old["pos"]) > 100:
                   notify("Car moved",
                          "Moved from: " + maplink(old["pos"]) + "\nNow parked at: " + maplink(pos),
-                         mapl
+                         maplink(pos))
+
+          if locked == "YES" and opened and (opened != (old or {}).get("open") or (old or {}).get("locked") != "YES"):
+              notify("Left open", "Your Skoda is locked but these are open: " + ", ".join(opened) + ".")
+
+          json.dump(new, open("state.json", "w"))
+          print("check done")
+          EOF
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: skoda-state-${{ github.run_id }}
+
