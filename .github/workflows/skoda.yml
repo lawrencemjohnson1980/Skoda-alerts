@@ -1,0 +1,138 @@
+name: Skoda alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load last known state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: skoda-state-${{ github.run_id }}
+          restore-keys: skoda-state-
+
+      - name: Check car
+        env:
+          SKODA_API_KEY: ${{ secrets.SKODA_API_KEY }}
+          SKODA_VIN: ${{ secrets.SKODA_VIN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, math, urllib.request, urllib.error
+
+          KEY = os.environ["SKODA_API_KEY"].strip()
+          VIN = os.environ["SKODA_VIN"].strip()
+          TOPIC = os.environ["NTFY_TOPIC"].strip()
+
+          def notify(title, message, click=None):
+              headers = {"Title": title}
+              if click:
+                  headers["Click"] = click
+              req = urllib.request.Request("https://ntfy.sh/" + TOPIC,
+                  data=message.encode("utf-8"), headers=headers, method="POST")
+              urllib.request.urlopen(req, timeout=30)
+
+          def maplink(p):
+              return "https://maps.google.com/?q=%s,%s" % (p[0], p[1])
+
+          def find_pos(o):
+              if isinstance(o, dict):
+                  lat = next((o[k] for k in o if k.lower() in ("latitude", "lat")), None)
+                  lon = next((o[k] for k in o if k.lower() in ("longitude", "lon", "lng")), None)
+                  if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                      return [lat, lon]
+                  for val in o.values():
+                      r = find_pos(val)
+                      if r:
+                          return r
+              elif isinstance(o, list):
+                  for val in o:
+                      r = find_pos(val)
+                      if r:
+                          return r
+              return None
+
+          def label(key):
+              k = key.lower()
+              if "roof" in k:
+                  return "sunroof"
+              if "boot" in k or "trunk" in k:
+                  return "boot"
+              return "windows"
+
+          def open_parts(o):
+              found = []
+              if isinstance(o, dict):
+                  for k, val in o.items():
+                      name = k.lower()
+                      if isinstance(val, str) and any(w in name for w in ("window", "roof", "boot", "trunk")):
+                          s = val.upper()
+                          if "OPEN" in s and "CLOSED" not in s and "NOT" not in s:
+                              found.append(label(k))
+                      else:
+                          found += open_parts(val)
+              elif isinstance(o, list):
+                  for val in o:
+                      found += open_parts(val)
+              return found
+
+          def distance_m(a, b):
+              r = 6371000
+              p1, p2 = math.radians(a[0]), math.radians(b[0])
+              dp = p2 - p1
+              dl = math.radians(b[1] - a[1])
+              h = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+              return 2 * r * math.asin(math.sqrt(h))
+
+          try:
+              old = json.load(open("state.json"))
+          except Exception:
+              old = None
+
+          try:
+              req = urllib.request.Request(
+                  "https://public.api.connect.skoda-auto.cz/api/v1/vehicles/" + VIN,
+                  headers={"X-API-Key": KEY})
+              data = json.load(urllib.request.urlopen(req, timeout=30))
+          except urllib.error.HTTPError as e:
+              if e.code in (401, 403):
+                  notify("Skoda alerts problem", "Your Skoda API key has expired or isn't working. Create a new one in the MySkoda app.")
+              print("check failed, code", e.code)
+              if old is not None:
+                  json.dump(old, open("state.json", "w"))
+              raise SystemExit(0)
+
+          v = data.get("vehicle", {})
+          status = v.get("status", {})
+          locked = status.get("overall", {}).get("doorsLocked")
+          parking = {k: val for k, val in v.items() if "parking" in k.lower()}
+          pos = find_pos(parking)
+          opened = sorted(set(open_parts(status)))
+
+          new = {"locked": locked,
+                 "pos": pos if pos else (old or {}).get("pos"),
+                 "moving": pos is None,
+                 "open": opened}
+
+          if old is None:
+              notify("Skoda alerts are set up", "Doors locked: %s" % locked, maplink(pos) if pos else None)
+          else:
+              if locked and old.get("locked") and locked != old.get("locked"):
+                  if locked == "YES":
+                      notify("Car locked", "Your Skoda has been locked.")
+                  else:
+                      notify("Car unlocked", "Your Skoda has been unlocked.")
+              if pos is None and not old.get("moving"):
+                  notify("Car on the move", "Your Skoda has left its parking spot.")
+              if pos and old.get("pos") and distance_m(pos, old["pos"]) > 100:
+                  notify("Car moved",
+                         "Moved from: " + maplink(old["pos"]) + "\nNow parked at: " + maplink(pos),
+                         mapl
